@@ -1,5 +1,5 @@
 //! One `/patch` or `/audit` run inside a Loop session: the state behind the
-//! `defensive__*` tools.
+//! run's tools.
 //!
 //!   prepare_task(target)  stages 0-3/4, then a sandbox container for the agent
 //!   (sandbox tools)       in that container, on `/work` only
@@ -111,6 +111,28 @@ impl Session {
         out
     }
 
+    /// The container of the run in progress, if any.
+    pub fn container_name(&self) -> Option<String> {
+        match &*self.active.lock() {
+            Active::Patch(r) if !r.done => r.sandbox.as_ref().map(|s| s.container.name.clone()),
+            Active::Audit(r) if !r.done => r.sandbox.as_ref().map(|s| s.container.name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Record a call of one of Loop's own tools in the run's tool log.
+    pub fn log_builtin(&self, name: &str, args: &Value, out: &Result<Value, String>, secs: f64) {
+        let active = self.active.lock();
+        let sandbox = match &*active {
+            Active::Patch(r) if !r.done => r.sandbox.as_ref(),
+            Active::Audit(r) if !r.done => r.sandbox.as_ref(),
+            _ => None,
+        };
+        if let Some(sandbox) = sandbox {
+            sandbox.log_call(name, args, out, secs);
+        }
+    }
+
     /// Run a tool by its bare name. Returns `(text, is_error)`.
     pub fn call(&self, name: &str, args: &Value) -> (String, bool) {
         let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
@@ -184,10 +206,7 @@ impl Session {
         let container = sandbox.container.name.clone();
         let out = p.take_output();
         let grades = max_grades();
-        let mut tools = "get_task, list_directory, read_file, search_code, write_file, edit_file, run_go, show_diff, submit_report".to_owned();
-        if p.kind != Kind::Cve && p.lang() != "go" {
-            tools = tools.replace("run_go", "run_command");
-        }
+        let tools = "get_task, list_directory, search_code, read, write, edit, bash, show_diff, submit_report";
         let text = if p.kind == Kind::Cve {
             format!(
                 "{out}\nSandbox ready: container {container} (no network). The vulnerable source is the workspace; use the \
@@ -315,7 +334,7 @@ impl Session {
         let out = a.rep.take_output();
         let text = format!(
             "{out}\nSandbox ready (no network): {}/{} at {}, language {}, {} static-analyzer leads to triage. Use \
-             list_directory, read_file, search_code, run_analyzer; then submit_finding per issue and submit_audit_report; \
+             list_directory, read, search_code, run_analyzer; then submit_finding per issue and submit_audit_report; \
              then finish_audit.",
             repo.owner,
             repo.name,
@@ -390,7 +409,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Session::new(dir.path().into(), dir.path().into());
         assert!(!s.in_progress());
-        let (text, err) = s.call("read_file", &json!({"path": "a"}));
+        let (text, err) = s.call("list_directory", &json!({"path": "a"}));
         assert!(err && text.contains("call prepare_task first"), "{text}");
         assert_eq!(s.grade_patch(), "No active task; call prepare_task first.");
         assert_eq!(s.finish_audit(), "No active audit.");

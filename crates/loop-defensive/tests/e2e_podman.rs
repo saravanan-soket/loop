@@ -1,18 +1,47 @@
 //! End to end with real podman: `/patch` on a local folder, driven by a
-//! scripted agent instead of a model. Needs rootless podman and network for
-//! the image build, so it is ignored by default:
+//! scripted agent through the run's toolset (Loop's own `read`, `write`,
+//! `edit`, `bash` bound to the container, plus the workflow's tools). Needs
+//! rootless podman and network for the image build, so it is ignored:
 //!
 //! `cargo test -p loop-defensive --test e2e_podman -- --ignored --nocapture`
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
-use loop_defensive::Session;
+use loop_agent::types::AgentTool;
+use loop_defensive::{tools, Session, Workflow};
 use serde_json::{json, Value};
 
-fn call(s: &Session, name: &str, args: Value) -> (Value, bool) {
-    let (text, err) = s.call(name, &args);
-    (serde_json::from_str(&text).unwrap_or(Value::String(text)), err)
+struct Agent {
+    tools: Vec<AgentTool>,
+}
+
+impl Agent {
+    /// Call a tool; returns (text, is_error).
+    async fn call(&self, name: &str, args: Value) -> (String, bool) {
+        let tool = self.tools.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("no tool {name}"));
+        match (tool.execute)("id".into(), args, None, None).await {
+            Ok(r) => {
+                let text = r
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        loop_ai::ToolResultContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (text, false)
+            }
+            Err(e) => (e, true),
+        }
+    }
+
+    async fn json(&self, name: &str, args: Value) -> (Value, bool) {
+        let (text, err) = self.call(name, args).await;
+        (serde_json::from_str(&text).unwrap_or(Value::String(text)), err)
+    }
 }
 
 fn project(dir: &Path) {
@@ -26,120 +55,114 @@ fn project(dir: &Path) {
     .unwrap();
 }
 
-#[test]
+const TEST: &str = "const test = require('node:test');\nconst assert = require('node:assert');\n\
+                    const { isSafe } = require('../src/paths');\n\
+                    test('rejects traversal', () => { assert.strictEqual(isSafe('../etc/passwd'), false); });\n";
+
+fn report(repro: &str) -> Value {
+    json!({"summary": "path traversal", "root_cause": "isSafe only rejected absolute paths",
+           "affected_files": ["src/paths.js"], "vulnerable_lines": "src/paths.js:1-3",
+           "fix_description": "reject .. segments", "verification": "repro fails before, passes after",
+           "repro_command": repro})
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs rootless podman and network"]
-fn patch_a_local_folder_end_to_end() {
+async fn patch_a_local_folder_end_to_end() {
     let runs = tempfile::tempdir().unwrap();
     let src = tempfile::tempdir().unwrap();
     project(src.path());
-    let s = Session::new(runs.path().into(), src.path().into());
+    let session = Arc::new(Session::new(runs.path().into(), src.path().into()));
+    let agent = Agent { tools: tools::tools(&session, Workflow::Patch) };
 
-    let ready = s.prepare_task(&src.path().to_string_lossy(), "");
+    let (ready, err) = agent.call("prepare_task", json!({"target": src.path().to_string_lossy()})).await;
     println!("{ready}");
-    assert!(ready.contains("STAGE 0 RESOLVE — PASS"), "{ready}");
-    assert!(ready.contains("STAGE 2 SANDBOX — PASS"), "{ready}");
-    assert!(ready.contains("Sandbox ready"), "{ready}");
-    assert!(s.in_progress());
+    assert!(!err && ready.contains("STAGE 2 SANDBOX — PASS") && ready.contains("Sandbox ready"), "{ready}");
+    assert!(session.in_progress());
 
-    let (task, err) = call(&s, "get_task", json!({}));
-    assert!(!err && task["mode"] == "repo", "{task}");
-    let (ls, err) = call(&s, "list_directory", json!({}));
-    assert!(!err && ls["entries"].as_array().unwrap().iter().any(|e| e == "src/"), "{ls}");
-    let (read, _) = call(&s, "read_file", json!({"path": "src/paths.js", "start_line": 2, "end_line": 2}));
-    assert_eq!(read["content"], "    2    return !p.startsWith('/');");
-    let (hits, _) = call(&s, "search_code", json!({"pattern": "startsWith"}));
+    let (task, _) = agent.json("get_task", json!({})).await;
+    assert_eq!(task["mode"], "repo", "{task}");
+    let (ls, _) = agent.json("list_directory", json!({})).await;
+    assert!(ls["entries"].as_array().unwrap().iter().any(|e| e == "src/"), "{ls}");
+    let (hits, _) = agent.json("search_code", json!({"pattern": "startsWith"})).await;
     assert_eq!(hits["matches"][0], "src/paths.js:2: return !p.startsWith('/');");
 
-    // The sandbox boundaries.
-    let (_, err) = call(&s, "write_file", json!({"path": ".defensive/x", "content": "x"}));
-    assert!(err, "reserved location");
-    let (_, err) = call(&s, "read_file", json!({"path": "../../etc/passwd"}));
-    assert!(err, "relative escape");
-    let (r, _) = call(&s, "run_command", json!({"command": "ln -s /etc/hostname leak && echo linked"}));
-    assert_eq!(r["exit_code"], 0, "{r}");
-    let (leak, err) = call(&s, "read_file", json!({"path": "leak"}));
-    assert!(err && leak["error"].as_str().unwrap().contains("escapes"), "{leak}");
-    let (net, _) = call(&s, "run_command", json!({"command": "getent hosts example.com || echo offline"}));
-    assert!(net["output"].as_str().unwrap().contains("offline"), "{net}");
-    call(&s, "run_command", json!({"command": "rm leak"}));
+    // Loop's own tools act inside the container.
+    let (read, err) = agent.call("read", json!({"path": "src/paths.js"})).await;
+    assert!(!err && read.contains("return !p.startsWith('/');"), "{read}");
+    let (pwd, _) = agent.call("bash", json!({"command": "pwd && cat /etc/os-release | head -1"})).await;
+    assert!(pwd.contains("/work") && pwd.contains("Debian"), "{pwd}");
+    let (net, _) = agent.call("bash", json!({"command": "getent hosts example.com || echo offline"})).await;
+    assert!(net.contains("offline"), "{net}");
+    // A planted symlink resolves in the container, never on the host.
+    let marker = src.path().join("host-only-secret");
+    fs::write(&marker, "HOST SECRET").unwrap();
+    agent.call("bash", json!({"command": format!("ln -s {} leak", marker.display())})).await;
+    let (leak, _) = agent.call("read", json!({"path": "leak"})).await;
+    assert!(!leak.contains("HOST SECRET"), "{leak}");
+    agent.call("bash", json!({"command": "rm leak"})).await;
 
     // Reproduce, then fix.
-    let test = "const test = require('node:test');\nconst assert = require('node:assert');\n\
-                const { isSafe } = require('../src/paths');\n\
-                test('rejects traversal', () => { assert.strictEqual(isSafe('../etc/passwd'), false); });\n";
-    let (w, err) = call(&s, "write_file", json!({"path": "test/repro.test.js", "content": test}));
-    assert!(!err && w["ok"] == true, "{w}");
-    let (before, _) = call(&s, "run_command", json!({"command": "node --test test/repro.test.js"}));
-    assert_ne!(before["exit_code"], 0, "{before}");
-    let (e, _) = call(
-        &s,
-        "edit_file",
-        json!({"path": "src/paths.js", "old_text": "return !p.startsWith('/');",
-               "new_text": "return !p.startsWith('/') && !p.split('/').includes('..');"}),
-    );
-    assert_eq!(e["ok"], true, "{e}");
-    let (after, _) = call(&s, "run_command", json!({"command": "node --test test/repro.test.js"}));
-    assert_eq!(after["exit_code"], 0, "{after}");
-    let (diff, _) = call(&s, "show_diff", json!({}));
-    assert_eq!(diff["code_files"], json!(["src/paths.js"]));
+    let (w, err) = agent.call("write", json!({"path": "test/repro.test.js", "content": TEST})).await;
+    assert!(!err, "{w}");
+    let (before, _) = agent.call("bash", json!({"command": "node --test test/repro.test.js; echo exit=$?"})).await;
+    assert!(before.contains("exit=1"), "{before}");
+    let (e, err) = agent
+        .call(
+            "edit",
+            json!({"path": "src/paths.js", "oldText": "return !p.startsWith('/');",
+                   "newText": "return !p.startsWith('/') && !p.split('/').includes('..');"}),
+        )
+        .await;
+    assert!(!err, "{e}");
+    let (after, _) = agent.call("bash", json!({"command": "node --test test/repro.test.js; echo exit=$?"})).await;
+    assert!(after.contains("exit=0"), "{after}");
+    let (diff, _) = agent.json("show_diff", json!({})).await;
+    assert_eq!(diff["code_files"], json!(["src/paths.js"]), "{diff}");
     assert_eq!(diff["test_files"], json!(["test/repro.test.js"]));
 
-    let (rep, err) = call(
-        &s,
-        "submit_report",
-        json!({"summary": "path traversal", "root_cause": "isSafe only rejected absolute paths",
-               "affected_files": ["src/paths.js"], "vulnerable_lines": "src/paths.js:1-3",
-               "fix_description": "reject .. segments", "verification": "repro fails before, passes after",
-               "repro_command": "node --test test/repro.test.js"}),
-    );
+    let (rep, err) = agent.json("submit_report", report("node --test test/repro.test.js")).await;
     assert!(!err && rep["ok"] == true, "{rep}");
-
-    let graded = s.grade_patch();
+    let (graded, _) = agent.call("grade_patch", json!({})).await;
     println!("{graded}");
-    assert!(graded.contains("verdict PATCH_VERIFIED"), "{graded}");
-    assert!(graded.contains("STAGE 7 FINAL — PASS"), "{graded}");
-    assert!(!s.in_progress());
+    assert!(graded.contains("verdict PATCH_VERIFIED") && graded.contains("STAGE 7 FINAL — PASS"), "{graded}");
+    // Loop's own tools are in the stage 5 tool count.
+    assert!(graded.contains("bash×") && graded.contains("edit×1"), "{graded}");
+    assert!(!session.in_progress());
+    let (after_end, err) = agent.call("read", json!({"path": "src/paths.js"})).await;
+    assert!(err || after_end.contains("prepare_task"), "{after_end}");
 
-    let run = fs::read_dir(runs.path().join("repo")).unwrap().next().unwrap().unwrap().path();
-    let latest = run.join("latest");
-    let md = fs::read_to_string(latest.join("report.md")).unwrap();
-    assert!(md.contains("## Stage 6 grade (attempt 1): PASS"), "{md}");
+    let latest = fs::read_dir(runs.path().join("repo")).unwrap().next().unwrap().unwrap().path().join("latest");
     let patch = fs::read_to_string(latest.join("attempt-1/candidate.patch")).unwrap();
     assert!(patch.contains("+++ b/src/paths.js"), "{patch}");
     let report: Value = serde_json::from_str(&fs::read_to_string(latest.join("report.json")).unwrap()).unwrap();
     assert_eq!(report["lifecycle"], "PATCH_VERIFIED");
-    assert_eq!(report["best"], json!({"attempt": 1, "final_status": "PATCH_VERIFIED"}));
     // The original folder was not modified.
     assert!(fs::read_to_string(src.path().join("src/paths.js")).unwrap().contains("return !p.startsWith('/');\n"));
     assert!(!src.path().join("test").exists());
 }
 
-#[test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs rootless podman and network"]
-fn a_wrong_fix_is_not_verified() {
+async fn a_wrong_fix_is_not_verified() {
     let runs = tempfile::tempdir().unwrap();
     let src = tempfile::tempdir().unwrap();
     project(src.path());
-    let s = Session::new(runs.path().into(), src.path().into());
-    assert!(s.prepare_task(&src.path().to_string_lossy(), "").contains("Sandbox ready"));
-    let test = "const test = require('node:test');\nconst assert = require('node:assert');\n\
-                const { isSafe } = require('../src/paths');\n\
-                test('rejects traversal', () => { assert.strictEqual(isSafe('../x'), false); });\n";
-    call(&s, "write_file", json!({"path": "test/repro.test.js", "content": test}));
-    // A "fix" that does not fix it.
-    call(&s, "edit_file", json!({"path": "src/paths.js", "old_text": "return", "new_text": "// noop\n  return"}));
-    call(
-        &s,
-        "submit_report",
-        json!({"summary": "s", "root_cause": "r", "affected_files": ["src/paths.js"], "vulnerable_lines": "src/paths.js:1-2",
-               "fix_description": "f", "verification": "v", "repro_command": "node --test test/repro.test.js"}),
-    );
-    let graded = s.grade_patch();
+    let session = Arc::new(Session::new(runs.path().into(), src.path().into()));
+    let agent = Agent { tools: tools::tools(&session, Workflow::Patch) };
+    let (ready, _) = agent.call("prepare_task", json!({"target": src.path().to_string_lossy()})).await;
+    assert!(ready.contains("Sandbox ready"), "{ready}");
+    agent.call("write", json!({"path": "test/repro.test.js", "content": TEST})).await;
+    agent
+        .call("edit", json!({"path": "src/paths.js", "oldText": "return", "newText": "// noop\n  return"}))
+        .await;
+    agent.call("submit_report", report("node --test test/repro.test.js")).await;
+    let (graded, _) = agent.call("grade_patch", json!({})).await;
     println!("{graded}");
     assert!(graded.contains("verdict REPRODUCIBLE"), "{graded}");
     assert!(graded.contains("Not verified: your reproduction test still fails on the patched code"), "{graded}");
-    assert!(s.in_progress(), "attempts remain");
-    let finished = s.finish_task();
+    assert!(session.in_progress(), "attempts remain");
+    let (finished, _) = agent.call("finish_task", json!({})).await;
     assert!(finished.contains("STAGE 7 FINAL"), "{finished}");
-    assert!(!s.in_progress());
+    assert!(!session.in_progress());
 }

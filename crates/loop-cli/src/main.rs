@@ -133,33 +133,6 @@ enum Commands {
     /// Show usage (tokens, models, tools, agents, sessions) in the terminal.
     #[cfg(feature = "usage")]
     Usage,
-    /// Find and fix vulnerabilities in a podman sandbox, or audit a repository,
-    /// without the TUI (the same workflows as `/patch` and `/audit`).
-    #[cfg(feature = "defensive")]
-    #[command(subcommand)]
-    Defensive(DefensiveCommand),
-}
-
-#[cfg(feature = "defensive")]
-#[derive(Debug, Subcommand)]
-enum DefensiveCommand {
-    /// Find, reproduce and fix a vulnerability, then grade the fix: a CVE id
-    /// (Go), a GitHub repository URL (optionally .../tree/<ref>) or a folder.
-    #[command(alias = "run")]
-    Patch {
-        /// CVE id, GitHub URL or folder.
-        target: String,
-    },
-    /// Review a GitHub repository for vulnerabilities and report them.
-    Audit {
-        /// GitHub repository URL.
-        url: String,
-    },
-    /// Print a finished run's report.md (a run directory or its `latest` link).
-    Report {
-        /// Run directory.
-        dir: PathBuf,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -330,14 +303,6 @@ async fn real_main() -> anyhow::Result<()> {
                 println!("Loop program files removed. User settings, credentials, skills and sessions kept.");
                 return Ok(());
             }
-            #[cfg(feature = "defensive")]
-            Commands::Defensive(DefensiveCommand::Report { dir }) => {
-                let md = dir.join("report.md");
-                let text = std::fs::read_to_string(&md)
-                    .map_err(|e| anyhow::anyhow!("{}: {e}", md.display()))?;
-                print!("{text}");
-                return Ok(());
-            }
             #[cfg(feature = "usage")]
             Commands::Usage => {
                 use loop_app_core::theme::{self, Theme};
@@ -421,25 +386,6 @@ async fn real_main() -> anyhow::Result<()> {
             _ => (),
         }
     }
-    // `loop defensive patch|audit` is print mode with the defensive toolset.
-    #[cfg(feature = "defensive")]
-    let defensive_run = {
-        use loop_app_core::defensive::{prompts, Workflow};
-        match cli.command.take() {
-            Some(Commands::Defensive(DefensiveCommand::Patch { target })) => {
-                cli.print = Some(prompts::patch(&target));
-                Some(Workflow::Patch)
-            }
-            Some(Commands::Defensive(DefensiveCommand::Audit { url })) => {
-                cli.print = Some(prompts::audit(&url));
-                Some(Workflow::Audit)
-            }
-            other => {
-                cli.command = other;
-                None
-            }
-        }
-    };
     let cwd = cli
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -604,29 +550,8 @@ async fn real_main() -> anyhow::Result<()> {
         )
         .await
     } else if let Some(prompt) = cli.print {
-        #[cfg(feature = "defensive")]
-        let defensive_session = match defensive_run {
-            Some(workflow) => {
-                use loop_app_core::defensive;
-                let session = std::sync::Arc::new(defensive::Session::new(
-                    defensive::runs_root(),
-                    runtime.harness.cwd(),
-                ));
-                defensive::begin(&runtime.harness, &runtime.tool_gate, &session, workflow).await?;
-                eprintln!("loop: defensive run; reports under {}", session.runs().display());
-                Some(session)
-            }
-            None => None,
-        };
         let result =
             print_mode::run_print(&mut runtime, prompt, cli.output_format, &cli.trace).await;
-        #[cfg(feature = "defensive")]
-        if let Some(session) = &defensive_session {
-            let report = loop_app_core::defensive::end(&runtime.harness, &runtime.tool_gate, Some(session)).await;
-            if !report.trim().is_empty() {
-                eprintln!("{}", report.trim_end());
-            }
-        }
         runtime.agents.shutdown().await;
         release().await;
         match result {
@@ -672,22 +597,6 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err(), "{args:?} still parses");
         }
-    }
-
-    #[cfg(feature = "defensive")]
-    #[test]
-    fn defensive_subcommands_parse() {
-        let cli = parse(&["loop", "defensive", "patch", "CVE-2022-36009"]);
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Defensive(DefensiveCommand::Patch { ref target })) if target == "CVE-2022-36009"
-        ));
-        let cli = parse(&["loop", "defensive", "run", "./repo"]);
-        assert!(matches!(cli.command, Some(Commands::Defensive(DefensiveCommand::Patch { .. }))));
-        let cli = parse(&["loop", "defensive", "audit", "https://github.com/o/r"]);
-        assert!(matches!(cli.command, Some(Commands::Defensive(DefensiveCommand::Audit { .. }))));
-        let cli = parse(&["loop", "defensive", "report", "runs/x/latest"]);
-        assert!(matches!(cli.command, Some(Commands::Defensive(DefensiveCommand::Report { .. }))));
     }
 
     #[test]

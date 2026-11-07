@@ -83,10 +83,6 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 - **Loop has an approval prompt only for `write`, `edit`, `bash`, `web_fetch`, `web_search` and plan mode's `exit_plan`.** An `ask` rule on any other tool (for example `read(~/.ssh/*)` or an MCP tool) refuses the call. Use `allow` or `deny` for those.
 - **A project's `.loop/settings.json`** can add `ask` and `deny` rules or make a rule stricter. It can't add `allow` rules or loosen a global rule.
 
-## Sandboxed workflows
-
-While `/patch` or `/audit` runs, its `defensive__*` tools own the toolset: no other tool is offered, and they run without asking in every mode, because they act inside a network-less podman container on a copy of the code. A deny rule still wins. See [defensive.md](defensive.md).
-
 ## Subscription agents
 
 Agents such as ChatGPT (codex-acp) run their own tools. Loop sets the agent's own mode to match:

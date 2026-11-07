@@ -195,18 +195,6 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             description: "List commands",
             args_hint: None,
         },
-        #[cfg(feature = "defensive")]
-        SlashCommand {
-            name: "patch",
-            description: "Find, reproduce and fix a vulnerability in a podman sandbox, then grade the fix",
-            args_hint: Some("<CVE-ID | github-url | folder | stop>"),
-        },
-        #[cfg(feature = "defensive")]
-        SlashCommand {
-            name: "audit",
-            description: "Review a GitHub repository for vulnerabilities in a podman sandbox and report them",
-            args_hint: Some("<github-url | stop>"),
-        },
         #[cfg(feature = "orchestration")]
         SlashCommand {
             name: "workflow",
@@ -420,14 +408,6 @@ pub enum CommandEffect {
     CloneSession,
     /// MCP sub-command.
     Mcp(McpCommand),
-    /// `/patch <target>` or `/audit <url>`; `stop` ends the run.
-    #[cfg(feature = "defensive")]
-    Defensive {
-        /// Which workflow.
-        workflow: loop_app_core::defensive::Workflow,
-        /// The target, or `stop`.
-        args: String,
-    },
     /// Multi-agent workflow from a goal string.
     #[cfg(feature = "orchestration")]
     Workflow {
@@ -671,21 +651,6 @@ pub fn dispatch(
             Ok(command) => CommandEffect::Mcp(command),
             Err(usage) => CommandEffect::Status(usage),
         },
-        #[cfg(feature = "defensive")]
-        name @ ("patch" | "audit") => {
-            use loop_app_core::defensive::Workflow;
-            let args = cmd.args.trim().to_owned();
-            if args.is_empty() {
-                CommandEffect::Status(if name == "patch" {
-                    "Usage: /patch <CVE-ID | github-url | folder> — /patch stop ends a run".into()
-                } else {
-                    "Usage: /audit <github-url> — /audit stop ends a run".into()
-                })
-            } else {
-                let workflow = if name == "patch" { Workflow::Patch } else { Workflow::Audit };
-                CommandEffect::Defensive { workflow, args }
-            }
-        }
         #[cfg(feature = "orchestration")]
         "workflow" => {
             if cmd.args.is_empty() {
@@ -762,32 +727,6 @@ pub type SharedCommands = Arc<Vec<SlashCommand>>;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "defensive")]
-    #[test]
-    fn patch_and_audit_dispatch() {
-        use loop_app_core::defensive::Workflow;
-        let parsed = |name: &str, args: &str| ParsedCommand {
-            name: name.into(),
-            args: args.into(),
-        };
-        match dispatch(&parsed("patch", " CVE-2022-36009 "), &[], &[]) {
-            CommandEffect::Defensive { workflow, args } => {
-                assert_eq!(workflow, Workflow::Patch);
-                assert_eq!(args, "CVE-2022-36009");
-            }
-            other => panic!("{other:?}"),
-        }
-        match dispatch(&parsed("audit", "stop"), &[], &[]) {
-            CommandEffect::Defensive { workflow, args } => {
-                assert_eq!((workflow, args.as_str()), (Workflow::Audit, "stop"));
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(matches!(dispatch(&parsed("patch", ""), &[], &[]), CommandEffect::Status(s) if s.starts_with("Usage: /patch")));
-        assert!(builtin_commands().iter().any(|c| c.name == "patch"));
-        assert!(builtin_commands().iter().any(|c| c.name == "audit"));
-    }
 
     #[test]
     fn parse_mcp_matches_skills_shape() {

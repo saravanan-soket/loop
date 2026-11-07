@@ -1,5 +1,6 @@
-//! The agent's sandbox tools: file access and commands inside the task
-//! container.
+//! The workflow's own sandbox tools (Loop's `read`, `write`, `edit` and
+//! `bash` cover the rest, see [`crate::env`]): listing, search, analyzers,
+//! the diff and submissions, inside the task container.
 //!
 //! Every file operation runs in the container (`podman exec`), so a symlink
 //! the agent's own commands planted can only ever point into the container's
@@ -135,33 +136,6 @@ impl Sandbox {
         }
     }
 
-    /// Read a file inside the container (as bytes, lossily decoded).
-    fn cat(&self, rel: &str, path: &str) -> Result<String, String> {
-        let script = format!("{}[ -d \"$p\" ] && exit 6; cat -- \"$p\"", self.resolve_script());
-        let r = self.exec_script(&script, &self.inner_path(rel), None);
-        if r.ok() {
-            Ok(r.stdout)
-        } else {
-            Err(Self::script_error(&r, path))
-        }
-    }
-
-    /// Write `content` to `rel` inside the container.
-    fn put(&self, rel: &str, path: &str, content: &str) -> Result<(), String> {
-        let root = shell_quote(&self.inner);
-        let script = format!(
-            "set -u; root={root}; t=\"$1\"; d=$(dirname -- \"$t\"); mkdir -p -- \"$d\" || exit 7; \
-             rd=$(realpath -e -- \"$d\") || exit 3; case \"$rd\" in \"$root\"|\"$root\"/*) ;; *) exit 4;; esac; \
-             [ -L \"$t\" ] && exit 5; [ -d \"$t\" ] && exit 6; cat > \"$t\""
-        );
-        let r = self.exec_script(&script, &self.inner_path(rel), Some(content));
-        if r.ok() {
-            Ok(())
-        } else {
-            Err(Self::script_error(&r, path))
-        }
-    }
-
     /// `get_task`.
     pub fn get_task(&self) -> ToolOutcome {
         let text = fs::read_to_string(&self.task_json).map_err(|e| format!("OSError: {e}"))?;
@@ -190,24 +164,6 @@ impl Sandbox {
             .take(500)
             .collect();
         Ok(json!({"path": path, "entries": entries}))
-    }
-
-    /// `read_file`.
-    pub fn read_file(&self, args: &Value) -> ToolOutcome {
-        let path = required(args, "path")?;
-        let rel = self.rel(path, false)?;
-        let text = self.cat(&rel, path)?;
-        let lines: Vec<&str> = text.lines().collect();
-        let n = lines.len() as i64;
-        let start = arg_int(args, "start_line").unwrap_or(1).max(1);
-        let end = match arg_int(args, "end_line").unwrap_or(0) {
-            0 => n,
-            e => e.min(n),
-        };
-        let body: Vec<String> = (start..=end)
-            .filter_map(|i| lines.get((i - 1) as usize).map(|l| format!("{i:5}  {l}")))
-            .collect();
-        Ok(json!({"path": path, "total_lines": n, "content": trunc(&body.join("\n"), MAX_OUT)}))
     }
 
     /// `search_code`: the tree is streamed out of the container as a tar and
@@ -274,30 +230,6 @@ impl Sandbox {
         Ok((out.stdout, probe.ok()))
     }
 
-    /// `write_file`.
-    pub fn write_file(&self, args: &Value) -> ToolOutcome {
-        let path = required(args, "path")?;
-        let content = required(args, "content")?;
-        let rel = self.rel(path, true)?;
-        self.put(&rel, path, content)?;
-        Ok(json!({"ok": true, "path": path, "bytes": content.len()}))
-    }
-
-    /// `edit_file`: replace exactly one occurrence.
-    pub fn edit_file(&self, args: &Value) -> ToolOutcome {
-        let path = required(args, "path")?;
-        let old = required(args, "old_text")?;
-        let new = required(args, "new_text")?;
-        let rel = self.rel(path, true)?;
-        let src = self.cat(&rel, path)?;
-        let n = if old.is_empty() { src.chars().count() + 1 } else { src.matches(old).count() };
-        if n != 1 {
-            return Ok(json!({"ok": false, "error": format!("old_text must match exactly once (matched {n} times)")}));
-        }
-        self.put(&rel, path, &src.replacen(old, new, 1))?;
-        Ok(json!({"ok": true, "path": path}))
-    }
-
     /// `run_go`.
     pub fn run_go(&self, args: &Value) -> ToolOutcome {
         let raw = required(args, "args")?;
@@ -314,23 +246,6 @@ impl Sandbox {
         let mut full: Vec<&str> = vec!["go"];
         full.extend(argv.iter().map(String::as_str));
         let r = self.container.exec(&full, Some(&self.inner), &[], None, COMMAND);
-        if r.timed_out {
-            return Ok(json!({"exit_code": null, "output": "timed out after 600s"}));
-        }
-        Ok(json!({"exit_code": r.exit, "output": trunc(&r.combined(), MAX_OUT)}))
-    }
-
-    /// `run_command`: a shell command in the workspace.
-    pub fn run_command(&self, args: &Value) -> ToolOutcome {
-        let command = required(args, "command")?;
-        let pythonpath = format!("{0}:{0}/src", self.inner);
-        let r = self.container.exec(
-            &["bash", "-c", command],
-            Some(&self.inner),
-            &[("PYTHONPATH", &pythonpath), ("CI", "true")],
-            None,
-            COMMAND,
-        );
         if r.timed_out {
             return Ok(json!({"exit_code": null, "output": "timed out after 600s"}));
         }
@@ -412,12 +327,8 @@ impl Sandbox {
         let out = match name {
             "get_task" => self.get_task(),
             "list_directory" => self.list_directory(args),
-            "read_file" => self.read_file(args),
             "search_code" => self.search_code(args),
-            "write_file" => self.write_file(args),
-            "edit_file" => self.edit_file(args),
             "run_go" => self.run_go(args),
-            "run_command" => self.run_command(args),
             "show_diff" => self.show_diff(),
             "run_analyzer" => self.run_analyzer(args),
             "submit_report" => self.submit_report(args),
@@ -429,7 +340,8 @@ impl Sandbox {
         out
     }
 
-    fn log_call(&self, name: &str, args: &Value, out: &ToolOutcome, secs: f64) {
+    /// Append one call to the tool log.
+    pub fn log_call(&self, name: &str, args: &Value, out: &ToolOutcome, secs: f64) {
         let short: serde_json::Map<String, Value> = args
             .as_object()
             .into_iter()

@@ -56,9 +56,6 @@ pub struct CliRuntime {
     pub startup_sessions: Option<StartupSessions>,
     /// `/usage` asked for the usage view; the chat loop opens it.
     pub usage_requested: bool,
-    /// The `/patch` or `/audit` run of this session, once one was started.
-    #[cfg(feature = "defensive")]
-    pub defensive: Option<std::sync::Arc<loop_app_core::defensive::Session>>,
 }
 
 /// Session choice to make when the TUI starts.
@@ -117,7 +114,5 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         confirm_full_access: false,
         confirm_export: None,
         usage_requested: false,
-        #[cfg(feature = "defensive")]
-        defensive: None,
     })
 }

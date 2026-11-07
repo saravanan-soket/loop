@@ -12,7 +12,10 @@
 
 pub mod analyzers;
 pub mod audit;
+pub mod env;
 pub mod grader;
+pub mod headless;
+pub mod mcp;
 pub mod patchlib;
 pub mod profiles;
 pub mod prompts;
@@ -26,4 +29,4 @@ pub mod tools;
 pub mod workspace;
 
 pub use session::Session;
-pub use tools::{Workflow, PREFIX};
+pub use tools::Workflow;

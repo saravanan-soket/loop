@@ -1,14 +1,22 @@
-//! The `defensive__*` agent tools.
+//! The toolset of a `/patch` or `/audit` run.
+//!
+//! File access and the shell are Loop's own `read`, `write`, `edit` and
+//! `bash`, bound to the run's container ([`crate::env::SandboxEnv`]). The
+//! workflow adds what Loop has no tool for: preparing the run, listing and
+//! searching inside the container, the analyzers, the diff, submissions and
+//! grading. `list_directory` and `search_code` stay separate from Loop's
+//! `ls` and `grep` because those read the host filesystem, which must not
+//! happen on a tree the sandboxed code can change.
 
 use std::sync::Arc;
+use std::time::Instant;
 
+use loop_agent::harness::{create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionEnv};
 use loop_agent::types::{AgentTool, AgentToolResult};
 use serde_json::{json, Value};
 
+use crate::env::SandboxEnv;
 use crate::session::Session;
-
-/// Prefix of every defensive tool name.
-pub const PREFIX: &str = "defensive__";
 
 /// Which workflow a toolset serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +27,24 @@ pub enum Workflow {
     Audit,
 }
 
+impl Workflow {
+    /// The tree the container sees, which Loop's tools are rooted at.
+    pub fn root(self) -> &'static str {
+        match self {
+            Workflow::Patch => "/work",
+            Workflow::Audit => "/opt/audit/source",
+        }
+    }
+
+    /// Loop's own tools the workflow uses, bound to its container.
+    pub fn builtins(self) -> &'static [&'static str] {
+        match self {
+            Workflow::Patch => &["read", "write", "edit", "bash"],
+            Workflow::Audit => &["read"],
+        }
+    }
+}
+
 fn schema(props: Value, required: &[&str]) -> Value {
     json!({"type": "object", "properties": props, "required": required})
 }
@@ -27,52 +53,29 @@ fn specs(workflow: Workflow) -> Vec<(&'static str, &'static str, Value)> {
     let s = json!({"type": "string"});
     let i = json!({"type": "integer"});
     let a = json!({"type": "array", "items": {"type": "string"}});
-    let common_read = [
-        ("list_directory", "List a directory of the source (in the sandbox).", schema(json!({"path": s}), &[])),
-        (
-            "read_file",
-            "Read a source file with line numbers (optional line range).",
-            schema(json!({"path": s, "start_line": i, "end_line": i}), &["path"]),
-        ),
+    let common = [
+        ("list_directory", "List a directory of the source inside the sandbox.", schema(json!({"path": s}), &[])),
         (
             "search_code",
-            "Regex search across the source.",
+            "Regex search across the source inside the sandbox (use this, not grep).",
             schema(json!({"pattern": s, "path": s, "max_results": i}), &["pattern"]),
         ),
     ];
     match workflow {
         Workflow::Patch => {
-            let mut v = vec![(
-                "prepare_task",
-                "Set up a task and its podman sandbox. `target` is a CVE id (resolve it, fetch the vulnerable source, \
-                 confirm the bug reproduces), a GitHub repo URL (optionally .../tree/<ref>) or a path to a local folder \
-                 (copied into the sandbox; the original is never modified). Prints a report per stage.",
-                schema(json!({"target": s, "ref": s}), &["target"]),
-            )];
-            v.push(("get_task", "Public facts about the task: the vulnerability or repository, language, build and test commands.", schema(json!({}), &[])));
-            v.extend(common_read);
+            let mut v = vec![
+                (
+                    "prepare_task",
+                    "Set up a task and its podman sandbox. `target` is a CVE id (resolve it, fetch the vulnerable \
+                     source, confirm the bug reproduces), a GitHub repo URL (optionally .../tree/<ref>) or a path to \
+                     a local folder (copied into the sandbox; the original is never modified). Prints a report per \
+                     stage. After it, read, write, edit and bash act inside the sandbox on /work.",
+                    schema(json!({"target": s, "ref": s}), &["target"]),
+                ),
+                ("get_task", "Public facts about the task: the vulnerability or repository, language, build and test commands.", schema(json!({}), &[])),
+            ];
+            v.extend(common);
             v.extend([
-                (
-                    "write_file",
-                    "Create or overwrite a file, e.g. a reproduction test.",
-                    schema(json!({"path": s, "content": s}), &["path", "content"]),
-                ),
-                (
-                    "edit_file",
-                    "Replace one exact occurrence of old_text with new_text.",
-                    schema(json!({"path": s, "old_text": s, "new_text": s}), &["path", "old_text", "new_text"]),
-                ),
-                (
-                    "run_go",
-                    "Run `go build|test|vet|list <args>` in the sandbox, e.g. 'test . -run TestRepro -v'.",
-                    schema(json!({"args": s}), &["args"]),
-                ),
-                (
-                    "run_command",
-                    "Run a shell command in the workspace inside the sandbox (no network), for non-Go projects: the \
-                     reproduction test, the build, the test suite. Dependencies were installed when the sandbox was built.",
-                    schema(json!({"command": s}), &["command"]),
-                ),
                 (
                     "run_analyzer",
                     "Static analyzers over the workspace (gosec | go_vet | govulncheck | bandit | npm_audit | all); \
@@ -105,14 +108,16 @@ fn specs(workflow: Workflow) -> Vec<(&'static str, &'static str, Value)> {
             v
         }
         Workflow::Audit => {
-            let mut v = vec![(
-                "prepare_audit",
-                "Stages 0-3 for a GitHub repo URL: clone at a pinned commit, build the audit sandbox, run the baseline \
-                 static scan. Prints a report per stage.",
-                schema(json!({"url": s, "ref": s}), &["url"]),
-            )];
-            v.push(("get_task", "Public facts about the repository under audit.", schema(json!({}), &[])));
-            v.extend(common_read);
+            let mut v = vec![
+                (
+                    "prepare_audit",
+                    "Stages 0-3 for a GitHub repo URL: clone at a pinned commit, build the audit sandbox, run the \
+                     baseline static scan. Prints a report per stage. After it, read acts inside the sandbox.",
+                    schema(json!({"url": s, "ref": s}), &["url"]),
+                ),
+                ("get_task", "Public facts about the repository under audit.", schema(json!({}), &[])),
+            ];
+            v.extend(common);
             v.extend([
                 (
                     "run_analyzer",
@@ -144,33 +149,72 @@ fn specs(workflow: Workflow) -> Vec<(&'static str, &'static str, Value)> {
     }
 }
 
-/// The tools for `workflow`, all backed by `session`.
-pub fn tools(session: &Arc<Session>, workflow: Workflow) -> Vec<AgentTool> {
-    specs(workflow)
-        .into_iter()
-        .map(|(name, description, parameters)| {
-            let session = Arc::clone(session);
-            let full = format!("{PREFIX}{name}");
-            AgentTool::simple(full.clone(), full, description, parameters, move |_id, args, _cancel, _update| {
-                let session = Arc::clone(&session);
-                async move {
-                    let (text, is_error) = tokio::task::spawn_blocking(move || session.call(name, &args))
-                        .await
-                        .map_err(|e| format!("defensive tool failed: {e}"))?;
-                    if is_error {
-                        Err(text)
-                    } else {
-                        Ok(AgentToolResult::text(text))
-                    }
-                }
+/// Wrap one of Loop's tools so its calls land in the run's tool log.
+fn logged(tool: AgentTool, session: &Arc<Session>) -> AgentTool {
+    let inner = Arc::clone(&tool.execute);
+    let session = Arc::clone(session);
+    let name = tool.name.clone();
+    AgentTool {
+        execute: Arc::new(move |id, args, cancel, on_update| {
+            let (inner, session, name) = (Arc::clone(&inner), Arc::clone(&session), name.clone());
+            Box::pin(async move {
+                let t0 = Instant::now();
+                let logged_args = args.clone();
+                let out = inner(id, args, cancel, on_update).await;
+                let summary = match &out {
+                    Ok(r) => Ok(serde_json::to_value(&r.content).unwrap_or_default()),
+                    Err(e) => Err(e.clone()),
+                };
+                let secs = t0.elapsed().as_secs_f64();
+                let _ = tokio::task::spawn_blocking(move || session.log_builtin(&name, &logged_args, &summary, secs)).await;
+                out
             })
-        })
-        .collect()
+        }),
+        ..tool
+    }
 }
 
-/// Tool names for `workflow`, prefixed.
+/// The toolset for `workflow`, all backed by `session`.
+pub fn tools(session: &Arc<Session>, workflow: Workflow) -> Vec<AgentTool> {
+    let env: Arc<dyn ExecutionEnv> = Arc::new(SandboxEnv::new(Arc::clone(session), workflow.root()));
+    let mut out: Vec<AgentTool> = workflow
+        .builtins()
+        .iter()
+        .map(|name| match *name {
+            "read" => create_read_tool(Arc::clone(&env)),
+            "write" => create_write_tool(Arc::clone(&env)),
+            "edit" => create_edit_tool(Arc::clone(&env)),
+            _ => create_bash_tool(Arc::clone(&env)),
+        })
+        .map(|t| logged(t, session))
+        .collect();
+    out.extend(specs(workflow).into_iter().map(|(name, description, parameters)| {
+        let session = Arc::clone(session);
+        AgentTool::simple(name, name, description, parameters, move |_id, args, _cancel, _update| {
+            let session = Arc::clone(&session);
+            async move {
+                let (text, is_error) = tokio::task::spawn_blocking(move || session.call(name, &args))
+                    .await
+                    .map_err(|e| format!("tool failed: {e}"))?;
+                if is_error {
+                    Err(text)
+                } else {
+                    Ok(AgentToolResult::text(text))
+                }
+            }
+        })
+    }));
+    out
+}
+
+/// Every tool name of `workflow`: Loop's own first, then the workflow's.
 pub fn names(workflow: Workflow) -> Vec<String> {
-    specs(workflow).into_iter().map(|(n, _, _)| format!("{PREFIX}{n}")).collect()
+    workflow
+        .builtins()
+        .iter()
+        .map(|n| (*n).to_owned())
+        .chain(specs(workflow).into_iter().map(|(n, _, _)| n.to_owned()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -178,25 +222,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toolsets_are_prefixed_and_distinct() {
+    fn toolsets_reuse_loop_tools_and_add_their_own() {
         let patch = names(Workflow::Patch);
-        assert!(patch.iter().all(|n| n.starts_with(PREFIX)));
-        assert!(patch.contains(&"defensive__grade_patch".to_owned()));
-        assert!(!patch.contains(&"defensive__submit_finding".to_owned()));
-        let audit = names(Workflow::Audit);
-        assert!(audit.contains(&"defensive__finish_audit".to_owned()));
-        assert!(!audit.iter().any(|n| n.ends_with("write_file") || n.ends_with("edit_file") || n.ends_with("run_command")));
-        for (_, _, params) in specs(Workflow::Patch).into_iter().chain(specs(Workflow::Audit)) {
-            assert_eq!(params["type"], "object");
+        for n in ["read", "write", "edit", "bash", "prepare_task", "grade_patch", "search_code"] {
+            assert!(patch.contains(&n.to_owned()), "{n}");
         }
+        for gone in ["read_file", "write_file", "edit_file", "run_command", "run_go", "submit_finding"] {
+            assert!(!patch.contains(&gone.to_owned()), "{gone}");
+        }
+        let audit = names(Workflow::Audit);
+        assert!(audit.contains(&"finish_audit".to_owned()) && audit.contains(&"read".to_owned()));
+        for writes in ["write", "edit", "bash"] {
+            assert!(!audit.contains(&writes.to_owned()), "audit is read-only: {writes}");
+        }
+        let unique: std::collections::BTreeSet<_> = patch.iter().collect();
+        assert_eq!(unique.len(), patch.len());
     }
 
     #[tokio::test]
-    async fn tool_reports_missing_task_as_error() {
+    async fn tools_before_prepare_say_so() {
         let dir = tempfile::tempdir().unwrap();
         let session = Arc::new(Session::new(dir.path().into(), dir.path().into()));
-        let read = tools(&session, Workflow::Patch).into_iter().find(|t| t.name == "defensive__read_file").unwrap();
-        let err = (read.execute)("1".into(), json!({"path": "x"}), None, None).await.unwrap_err();
+        let tools = tools(&session, Workflow::Patch);
+        let find = |n: &str| tools.iter().find(|t| t.name == n).unwrap().clone();
+        let err = (find("list_directory").execute)("1".into(), json!({}), None, None).await.unwrap_err();
         assert!(err.contains("prepare_task"), "{err}");
+        let read = (find("read").execute)("2".into(), json!({"path": "a.txt"}), None, None).await;
+        let text = match read {
+            Ok(r) => serde_json::to_string(&r.content).unwrap(),
+            Err(e) => e,
+        };
+        assert!(text.contains("prepare_task"), "{text}");
     }
 }
