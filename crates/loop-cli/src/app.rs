@@ -1596,6 +1596,10 @@ async fn drain_ui_events(
                     active_agent_name(runtime),
                     live_plan,
                 );
+                #[cfg(feature = "defensive")]
+                if !*working {
+                    finish_defensive_if_done(runtime, chat, status).await;
+                }
             }
             UiEvent::AgentReady { id, model, result } => {
                 runtime.starting_agent = None;
@@ -5120,7 +5124,13 @@ async fn apply_effect(
     refresh_token_bar: &mut bool,
 ) -> anyhow::Result<bool> {
     match effect {
-        CommandEffect::Quit => return Ok(true),
+        CommandEffect::Quit => {
+            #[cfg(feature = "defensive")]
+            if runtime.defensive.is_some() {
+                let _ = loop_app_core::defensive::end(&runtime.harness, &runtime.tool_gate, runtime.defensive.as_ref()).await;
+            }
+            return Ok(true);
+        }
         CommandEffect::Status(s) => {
             if s.contains("Usage: /theme") {
                 let dirs = crate::theme::theme_search_dirs(
@@ -6022,6 +6032,22 @@ async fn apply_effect(
                 chat.push(sys(format!("template not found: {name}")));
             }
         }
+        #[cfg(feature = "defensive")]
+        CommandEffect::Defensive { workflow, args } => {
+            start_defensive(
+                runtime,
+                chat,
+                status,
+                turn_step,
+                streaming_assistant,
+                streaming_thinking,
+                working,
+                tx,
+                workflow,
+                &args,
+            )
+            .await;
+        }
         #[cfg(feature = "orchestration")]
         CommandEffect::Workflow { goal, concurrency } => {
             if agent_is_busy(runtime, *working) {
@@ -6033,6 +6059,105 @@ async fn apply_effect(
     }
     let _ = hide_thinking;
     Ok(false)
+}
+
+/// `/patch <target>`, `/audit <url>`, or `stop` for either: give the
+/// sandboxed `defensive__*` tools the toolset and start the run's prompt.
+#[cfg(feature = "defensive")]
+#[allow(clippy::too_many_arguments)]
+async fn start_defensive(
+    runtime: &mut CliRuntime,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    turn_step: &mut String,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    working: &mut bool,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    workflow: loop_app_core::defensive::Workflow,
+    args: &str,
+) {
+    use loop_app_core::defensive::{self, Workflow};
+    let name = match workflow {
+        Workflow::Patch => "patch",
+        Workflow::Audit => "audit",
+    };
+    if args == "stop" {
+        let running = runtime.defensive.as_ref().is_some_and(|s| s.in_progress());
+        if !defensive::active(&runtime.tool_gate) && !running {
+            chat.push(sys(format!("no /{name} run is active")));
+            return;
+        }
+        if agent_is_busy(runtime, *working) {
+            chat.push(sys(format!("interrupt the current turn first (Esc), then /{name} stop")));
+            return;
+        }
+        let report = defensive::end(&runtime.harness, &runtime.tool_gate, runtime.defensive.as_ref()).await;
+        if !report.trim().is_empty() {
+            chat.push(sys(report.trim_end().to_owned()));
+        }
+        chat.push(sys(format!("/{name} stopped · Loop's own tools are back")));
+        *status = "ready".into();
+        return;
+    }
+    if !runtime.is_native() {
+        chat.push(sys(format!("/{name} runs on Loop's own agent; switch back from the external agent first")));
+        return;
+    }
+    if agent_is_busy(runtime, *working) {
+        chat.push(sys(format!("cannot start /{name} while the agent is busy")));
+        return;
+    }
+    let cwd = runtime.harness.cwd();
+    let session = Arc::clone(
+        runtime
+            .defensive
+            .get_or_insert_with(|| Arc::new(defensive::Session::new(defensive::runs_root(), cwd))),
+    );
+    if let Err(e) = defensive::begin(&runtime.harness, &runtime.tool_gate, &session, workflow).await {
+        chat.push(error_item(format!("error: {e}")));
+        return;
+    }
+    chat.push(sys(format!(
+        "/{name}: only the sandboxed defensive__* tools run until it finishes · runs in {} · /{name} stop ends it",
+        session.runs().display()
+    )));
+    let prompt = match workflow {
+        Workflow::Patch => defensive::prompts::patch(args),
+        Workflow::Audit => defensive::prompts::audit(args),
+    };
+    start_user_turn(
+        runtime,
+        chat,
+        status,
+        turn_step,
+        streaming_assistant,
+        streaming_thinking,
+        working,
+        format!("/{name} {args}"),
+        prompt,
+        Vec::new(),
+        tx,
+    );
+}
+
+/// After a turn: hand the toolset back once the `/patch` or `/audit` run
+/// is over (finished, never started, or given up).
+#[cfg(feature = "defensive")]
+async fn finish_defensive_if_done(runtime: &mut CliRuntime, chat: &mut Vec<ChatItem>, status: &mut String) {
+    use loop_app_core::defensive;
+    if !defensive::active(&runtime.tool_gate) {
+        return;
+    }
+    if runtime.defensive.as_ref().is_some_and(|s| s.in_progress()) {
+        *status = "defensive run active · reply to continue · /patch stop or /audit stop ends it".into();
+        return;
+    }
+    let report = defensive::end(&runtime.harness, &runtime.tool_gate, runtime.defensive.as_ref()).await;
+    if !report.trim().is_empty() {
+        push_before_queued(chat, sys(report.trim_end().to_owned()));
+    }
+    push_before_queued(chat, sys("defensive run finished · Loop's own tools are back"));
 }
 
 #[cfg(feature = "orchestration")]

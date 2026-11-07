@@ -11,6 +11,8 @@ readme = "README.md"
 default = []
 # Tracing control (`TracingControl`, `Runtime::attach_telemetry`). Off by default.
 telemetry = ["loop-agent/telemetry", "dep:loop-telemetry"]
+# `/patch` and `/audit`: sandboxed vulnerability repair and review (`loop-defensive`).
+defensive = ["dep:loop-defensive"]
 
 [dependencies]
 loop-ai = { workspace = true }
@@ -18,6 +20,7 @@ loop-agent = { workspace = true, features = ["mcp", "sqlite"] }
 loop-protocol = { workspace = true }
 loop-acp = { workspace = true }
 loop-mcp = { workspace = true }
+loop-defensive = { workspace = true, optional = true }
 loop-telemetry = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

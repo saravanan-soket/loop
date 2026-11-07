@@ -78,6 +78,10 @@ pub struct ToolGate {
     allowed: Mutex<HashMap<String, usize>>,
     /// MCP servers, for the tools they mark read-only.
     mcp: Mutex<Option<Arc<loop_mcp::McpClientManager>>>,
+    /// While a sandboxed workflow runs (`/patch`, `/audit`), the tool-name
+    /// prefix it owns: only those tools are offered, and they run without
+    /// asking because they act inside its network-less container.
+    focus: Mutex<Option<String>>,
 }
 
 impl ToolGate {
@@ -116,6 +120,9 @@ impl ToolGate {
     /// Whether `tool` is offered to the model: a tool whose Capability is
     /// off is taken out of the toolset, not just refused.
     pub fn available(&self, tool: &str) -> bool {
+        if let Some(prefix) = self.focus.lock().as_deref() {
+            return tool.starts_with(prefix);
+        }
         let call = Call {
             kind: self.kind_now(tool),
             ..Call::new(tool, serde_json::Value::Null, self.workspace())
@@ -214,9 +221,33 @@ impl ToolGate {
     /// approver.
     pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
         let call = self.call(tool, args).await;
-        self.policy
+        let decision = self
+            .policy
             .lock()
-            .decide(self.mode(), &self.permissions.lock(), &call)
+            .decide(self.mode(), &self.permissions.lock(), &call);
+        let focus = self.focus.lock().clone();
+        match focus {
+            None => decision,
+            Some(prefix) if !tool.starts_with(&prefix) => Decision::Deny(format!(
+                "only the `{prefix}*` tools can run while this sandboxed workflow is active"
+            )),
+            // A deny rule still wins; anything else runs inside the sandbox.
+            Some(_) => match decision {
+                Decision::Deny(reason) => Decision::Deny(reason),
+                _ => Decision::Allow,
+            },
+        }
+    }
+
+    /// Give a sandboxed workflow the toolset (`Some(prefix)`), or end it.
+    pub fn set_focus(&self, prefix: Option<String>) {
+        *self.focus.lock() = prefix;
+        self.allowed.lock().clear();
+    }
+
+    /// The prefix of the sandboxed workflow that owns the toolset, if any.
+    pub fn focus(&self) -> Option<String> {
+        self.focus.lock().clone()
     }
 
     async fn call(&self, tool: &str, args: &serde_json::Value) -> Call {
@@ -571,6 +602,26 @@ mod tests {
             .unwrap()
             .contains("needs approval in ask mode"));
         assert!(before(call("read"), None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sandbox_focus_owns_the_toolset() {
+        let gate = ToolGate::new(crate::tool_approval::permissions_from_settings(
+            &BTreeMap::from([("defensive__run_go".into(), "deny".into())]),
+        ));
+        let before = gate.before_hook();
+        gate.set_focus(Some("defensive__".into()));
+        assert!(gate.available("defensive__read_file"));
+        assert!(!gate.available("bash") && !gate.available("read"));
+        assert!(before(call("defensive__run_command"), None).await.is_none());
+        let other = before(call("bash"), None).await.expect("outside the focus");
+        assert!(other.reason.unwrap().contains("defensive__*"));
+        let denied = before(call("defensive__run_go"), None).await.expect("deny rule wins");
+        assert!(denied.reason.unwrap().contains("denied"));
+        gate.set_focus(None);
+        assert!(gate.available("read"));
+        let after = before(call("bash"), None).await;
+        assert!(after.and_then(|r| r.reason).is_none_or(|r| !r.contains("defensive__*")));
     }
 
     #[tokio::test]

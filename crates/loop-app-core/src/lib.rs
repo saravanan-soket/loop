@@ -3,6 +3,8 @@
 pub mod agent_gate;
 pub mod agents;
 pub mod config;
+#[cfg(feature = "defensive")]
+pub mod defensive;
 pub mod extensions;
 pub mod hook_command;
 pub mod hooks_load;

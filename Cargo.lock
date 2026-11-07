@@ -4588,6 +4588,7 @@ dependencies = [
  "loop-acp",
  "loop-agent",
  "loop-ai",
+ "loop-defensive",
  "loop-mcp",
  "loop-protocol",
  "loop-telemetry",
