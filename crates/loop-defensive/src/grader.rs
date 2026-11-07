@@ -25,7 +25,10 @@ use crate::scoring::{empty_grader_dims, infrastructure_failure};
 const BASELINE: &str = "/opt/defensive/baseline";
 const WORK: &str = "/tmp/grade";
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
-const DEP_DIRS: &[&str] = &["node_modules", "vendor"];
+/// Installed dependency directories linked (not copied) into scratch trees.
+/// Composer's `vendor/` is copied instead: its autoloader resolves the
+/// project's own classes relative to the real vendor path.
+const DEP_DIRS: &[&str] = &["node_modules"];
 
 fn test_timeout() -> Duration {
     std::env::var("DEF_TEST_TIMEOUT")
@@ -261,6 +264,11 @@ pub fn grade_repo(tag: &str, patch: &str, oracle_dir: &Path) -> Value {
         None => return infrastructure_failure("grader error: no oracle.json"),
     };
     let s = |k: &str| o[k].as_str().unwrap_or("").trim().to_owned();
+    // Upstream tests (a CVE's hidden oracle) replace the files they change, so
+    // the existing suite runs with them; an agent's own test is kept apart.
+    let tests_include_oracle = o["existing_tests_include_oracle"] == true;
+    // Upstream tests for a denial-of-service bug hang on the vulnerable code.
+    let timeout_reproduces = o["timeout_reproduces"] == true;
     let (lang, repro, build, tests) = (
         o["lang"].as_str().unwrap_or("generic").to_owned(),
         s("repro_command"),
@@ -297,11 +305,13 @@ pub fn grade_repo(tag: &str, patch: &str, oracle_dir: &Path) -> Value {
         b.overlay(&base)?;
         let br = b.run(&repro, &base);
         let b_out = outcome(&br);
-        dims.insert("baseline_reproduced".into(), (b_out == "fail").into());
+        let reproduced = b_out == "fail" || (timeout_reproduces && b_out == "timeout");
+        dims.insert("baseline_reproduced".into(), reproduced.into());
+        let note = if reproduced && b_out == "timeout" { " (the vulnerable code hangs: counts as reproduced)" } else { "" };
         steps.add(
             "B reproduce",
-            if b_out == "fail" { "pass" } else { "fail" },
-            format!("`{repro}` on the original code: {b_out} (expected fail)"),
+            if reproduced { "pass" } else { "fail" },
+            format!("`{repro}` on the original code: {b_out} (expected fail){note}"),
             &[("log_tail", tail(br["log_tail"].as_str().unwrap_or(""), 800).into())],
         );
 
@@ -325,9 +335,14 @@ pub fn grade_repo(tag: &str, patch: &str, oracle_dir: &Path) -> Value {
                 };
                 dims.insert("candidate_build_passed".into(), built.into());
                 if built {
-                    // E existing tests first, on the candidate WITHOUT the agent's tests.
+                    // E existing tests first: WITHOUT the agent's own tests, or WITH
+                    // the upstream ones they replace.
+                    if tests_include_oracle {
+                        b.overlay(&cand)?;
+                    }
                     if tests.is_empty() {
-                        steps.add("E existing tests", "skip", "no test suite detected for this project", &[]);
+                        let why = o["existing_tests_note"].as_str().unwrap_or("no test suite detected for this project");
+                        steps.add("E existing tests", "skip", why, &[]);
                     } else {
                         let e = b.run(&tests, &cand);
                         let base_out = base_tests.as_ref().map(outcome).unwrap_or("fail");

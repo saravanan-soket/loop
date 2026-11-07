@@ -16,6 +16,7 @@ pub mod env;
 pub mod grader;
 pub mod headless;
 pub mod mcp;
+pub mod oracle;
 pub mod patchlib;
 pub mod profiles;
 pub mod prompts;

@@ -43,5 +43,27 @@ A-G in a fresh `--network none` container that never saw the agent's.
 | `analyzers` | gosec, go vet, govulncheck, bandit, npm audit |
 | `patchlib`, `scoring`, `report` | Diffs, the 12 checks, stage reports |
 
+## Languages
+
+`/patch <folder | github-url>` works for any language. `/patch CVE-…` uses the
+upstream fix's tests as the hidden oracle, run with the project's own runner:
+
+| Ecosystem | Hidden tests run with | Verified end to end on |
+|---|---|---|
+| Go | `go test -run` (per test function) | CVE-2022-36009 |
+| Python | pytest | CVE-2022-29217 (PyJWT) |
+| JavaScript / TypeScript | jest, vitest, mocha, ava, tap or `node --test` | CVE-2020-7788 (ini) |
+| Rust | `cargo test --test <target>` (integration tests) | CVE-2022-24713 (regex) |
+| Java | Maven `-Dtest=` / Gradle `--tests`, JDK picked from the build file | CVE-2022-25845 (fastjson) |
+| Ruby | rspec or minitest / test-unit, gemspec-only gems included | CVE-2022-31163 (tzinfo) |
+| PHP | phpunit | CVE-2022-31042 (guzzle) |
+
+HTML/CSS sites run under the JavaScript profile. A CVE whose fix has several
+commits (one per branch) is tried commit by commit until one confirms. A
+fix whose test hangs on the vulnerable code (ReDoS, DoS) counts as
+reproduced. If the upstream fix itself fails the existing suite, regressions
+are not graded and the report says so.
+
 Tests: `cargo test -p loop-defensive`. With podman:
-`cargo test -p loop-defensive --test e2e_podman -- --ignored`.
+`cargo test -p loop-defensive --test e2e_podman -- --ignored` and, per language,
+`cargo test -p loop-defensive --test e2e_cve -- --ignored`.

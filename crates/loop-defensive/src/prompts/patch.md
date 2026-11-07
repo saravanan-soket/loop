@@ -1,6 +1,6 @@
 Run the defensive workflow for $1 using only the `mcp__defensive__*` tools. Do not use Loop's own read, write, edit, bash, grep, find or ls tools: they act on this machine, while `mcp__defensive__read`, `mcp__defensive__write`, `mcp__defensive__edit` and `mcp__defensive__bash` act inside the network-less sandbox on a copy of the code.
 
-$1 is a CVE id, a GitHub repository URL, or a local folder. If it is a relative folder path, turn it into an absolute path first (relative to the current working directory). Repositories and folders can be in any language; CVE ids must be Go projects.
+$1 is a CVE id, a GitHub repository URL, or a local folder. If it is a relative folder path, turn it into an absolute path first (relative to the current working directory). Any language works: for a CVE, the hidden security tests come from the upstream fix (Go, Python, JavaScript/TypeScript, Rust, Java, Ruby and PHP projects).
 
 1. Call `mcp__defensive__prepare_task` with target "$1". Show me the stage reports it prints. If it says the target cannot be worked on, explain why and stop.
 2. Identify the bug: call `mcp__defensive__get_task`, then investigate with `mcp__defensive__list_directory`, `mcp__defensive__search_code` and `mcp__defensive__read` until you know the vulnerable code and its root cause.

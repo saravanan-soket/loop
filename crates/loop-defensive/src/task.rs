@@ -1,6 +1,7 @@
 //! `/patch`: one task from target to verdict.
 //!
-//! A CVE id (Go modules):
+//! A CVE id (Go, Python, JS/TS, Rust, Java, Ruby, PHP; the hidden oracle is
+//! the upstream fix's tests, see [`crate::oracle`]):
 //!   0 resolve   CVE record + OSV record -> description, CWE, fix commits
 //!   1 fetch     clone the repo; vulnerable = the fix's parent
 //!   2 split     the upstream fix -> reference patch + hidden oracle tests
@@ -37,7 +38,7 @@ use crate::sources::{self, CveInfo, StopStage, Target, TaskSource};
 use crate::workspace;
 
 /// Stage facts that would reveal the hidden oracle to an agent reading the reports.
-pub const HIDDEN_FACTS: &[&str] = &["code files (reference patch)", "oracle test files", "oracle tests"];
+pub const HIDDEN_FACTS: &[&str] = &["code files (reference patch)", "oracle test files", "oracle tests", "oracle command"];
 
 /// What a task was created from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -660,105 +661,166 @@ pub fn prepare_cve(cve: &str, runs: &Path, hidden: &Path) -> Result<Task, String
     );
     p.cve = Some(info.clone());
 
-    // 1 fetch + 2 split
-    let t = Timer::start();
-    let src = match sources::fetch_and_split(&info, &task_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            p.stop("1 fetch+split", &e);
+    // 1-4, once per upstream fix commit until one confirms (a CVE fixed on
+    // several branches lists one commit per branch).
+    let mut tried: Vec<String> = Vec::new();
+    loop {
+        // 1 fetch + 2 split
+        let t = Timer::start();
+        let src = match sources::fetch_and_split_except(&info, &task_dir, &tried) {
+            Ok(s) => s,
+            Err(e) => {
+                if tried.is_empty() {
+                    p.stop("1 fetch+split", &e);
+                }
+                return Ok(p);
+            }
+        };
+        tried.push(src.fix_commit.clone());
+        p.rep.emit(
+            StageResult::new("1 fetch", "PASS", format!("cloned {}; vulnerable commit is the fix's parent", src.repo))
+                .lifecycle("CLASSIFIED")
+                .secs(t.secs())
+                .fact("fix commit", src.fix_commit.clone())
+                .fact("vulnerable commit", src.vulnerable_commit.clone())
+                .fact("baseline files", patchlib::list_files(&src.baseline_dir).len()),
+        );
+        let go = src.profile.lang == "go";
+        let ecosystem = if go {
+            format!("Go (image golang:{})", src.go_version)
+        } else {
+            format!("{} (image {})", src.profile.label, src.profile.image)
+        };
+        let mut split = StageResult::new(
+            "2 split",
+            "PASS",
+            format!("{} task; upstream fix split into a reference patch and hidden oracle tests", if go { "Go module" } else { src.profile.label.as_str() }),
+        )
+        .lifecycle("CLASSIFIED")
+        .fact("ecosystem", ecosystem)
+        .fact("code files (reference patch)", src.code_files.join(", "))
+        .fact("oracle test files", src.test_files.join(", "));
+        split = if go {
+            split.fact("oracle tests", src.oracle_tests.join(", ")).fact("oracle packages", src.oracle_packages.join(", "))
+        } else {
+            split.fact("oracle command", src.oracle_command.clone())
+        };
+        p.rep.emit(split);
+        if !go {
+            p.profile = Some(src.profile.clone());
+        }
+        p.summary.insert("repo".into(), src.repo.clone().into());
+        p.summary.insert("fix_commit".into(), src.fix_commit.clone().into());
+        p.set_lifecycle("CLASSIFIED");
+        p.go_version = src.go_version.clone();
+        p.src = Some(src.clone());
+
+        // 3 sandbox
+        if let Err(e) = sandbox::podman_available() {
+            p.rep.emit(StageResult::new("3 sandbox", "FAIL", e).lifecycle("FAILED"));
+            p.set_lifecycle("FAILED");
             return Ok(p);
         }
-    };
-    p.rep.emit(
-        StageResult::new("1 fetch", "PASS", format!("cloned {}; vulnerable commit is the fix's parent", src.repo))
-            .lifecycle("CLASSIFIED")
-            .secs(t.secs())
-            .fact("fix commit", src.fix_commit.clone())
-            .fact("vulnerable commit", src.vulnerable_commit.clone())
-            .fact("baseline files", patchlib::list_files(&src.baseline_dir).len()),
-    );
-    p.rep.emit(
-        StageResult::new("2 split", "PASS", "Go module task; upstream fix split into a reference patch and hidden oracle tests")
-            .lifecycle("CLASSIFIED")
-            .fact("ecosystem", format!("Go (image golang:{})", src.go_version))
-            .fact("code files (reference patch)", src.code_files.join(", "))
-            .fact("oracle test files", src.test_files.join(", "))
-            .fact("oracle tests", src.oracle_tests.join(", "))
-            .fact("oracle packages", src.oracle_packages.join(", ")),
-    );
-    p.summary.insert("repo".into(), src.repo.clone().into());
-    p.summary.insert("fix_commit".into(), src.fix_commit.clone().into());
-    p.set_lifecycle("CLASSIFIED");
-    p.go_version = src.go_version.clone();
-    p.src = Some(src.clone());
-
-    // 3 sandbox
-    if let Err(e) = sandbox::podman_available() {
-        p.rep.emit(StageResult::new("3 sandbox", "FAIL", e).lifecycle("FAILED"));
-        p.set_lifecycle("FAILED");
-        return Ok(p);
-    }
-    let t = Timer::start();
-    let mut pkgs: Vec<String> = src.oracle_packages.clone();
-    for f in &src.code_files {
-        let pkg = f.rsplit_once('/').map_or_else(|| ".".to_owned(), |(d, _)| format!("./{d}"));
-        if !pkgs.contains(&pkg) {
-            pkgs.push(pkg);
+        let t = Timer::start();
+        let mut pkgs: Vec<String> = src.oracle_packages.clone();
+        for f in &src.code_files {
+            let pkg = f.rsplit_once('/').map_or_else(|| ".".to_owned(), |(d, _)| format!("./{d}"));
+            if !pkgs.contains(&pkg) {
+                pkgs.push(pkg);
+            }
         }
-    }
-    pkgs.sort();
-    let img = sandbox::build_go_image(&cve, &src.go_version, &task_dir, &pkgs, false);
-    if !img.ok {
+        pkgs.sort();
+        let img = if go {
+            sandbox::build_go_image(&cve, &src.go_version, &task_dir, &pkgs, false)
+        } else {
+            sandbox::build_repo_image(&cve, &src.profile, &task_dir)
+        };
+        if !img.ok {
+            p.rep.emit(
+                StageResult::new("3 sandbox", "FAIL", "podman build failed")
+                    .lifecycle("FAILED")
+                    .secs(t.secs())
+                    .fact("log tail", patchlib::tail(&img.log_tail, 600)),
+            );
+            p.set_lifecycle("FAILED");
+            return Ok(p);
+        }
         p.rep.emit(
-            StageResult::new("3 sandbox", "FAIL", "podman build failed")
-                .lifecycle("FAILED")
+            StageResult::new("3 sandbox", "PASS", format!("built {}", img.tag))
+                .lifecycle("BUILDABLE")
                 .secs(t.secs())
-                .fact("log tail", patchlib::tail(&img.log_tail, 600)),
+                .fact("image id", img.digest.clone().unwrap_or_default().chars().take(19).collect::<String>())
+                .fact("runtime limits", sandbox::limits_text()),
         );
-        p.set_lifecycle("FAILED");
-        return Ok(p);
-    }
-    p.rep.emit(
-        StageResult::new("3 sandbox", "PASS", format!("built {}", img.tag))
-            .lifecycle("BUILDABLE")
-            .secs(t.secs())
-            .fact("image id", img.digest.clone().unwrap_or_default().chars().take(19).collect::<String>())
-            .fact("runtime limits", sandbox::limits_text()),
-    );
-    p.set_lifecycle("BUILDABLE");
+        p.set_lifecycle("BUILDABLE");
 
-    // 4 confirm: the upstream fix must fail-then-pass the oracle
-    let t = Timer::start();
-    let conf = grader::grade_go(&img.tag, &src.reference_patch, &task_dir.join("oracle"), "");
-    let _ = fs::write(task_dir.join("confirm_grade.json"), to_json_pretty(&conf));
-    let ok = conf["final_status"] == "PATCH_VERIFIED";
-    let summary = if ok {
-        "upstream fix verified: the oracle fails on the vulnerable code and passes with the fix".to_owned()
-    } else {
-        format!(
-            "upstream fix not verified ({}); this CVE cannot be graded fairly",
-            conf["final_status"].as_str().unwrap_or("?")
-        )
-    };
-    p.rep.emit(
-        StageResult::new("4 confirm", if ok { "PASS" } else { "STOP" }, summary)
-            .lifecycle(if ok { "REPRODUCIBLE" } else { "INCONCLUSIVE" })
-            .secs(t.secs())
-            .facts(step_facts(&conf)),
-    );
-    p.set_lifecycle(if ok { "REPRODUCIBLE" } else { "INCONCLUSIVE" });
-    if !ok {
+        // 4 confirm: the upstream fix must fail-then-pass the oracle
+        let t = Timer::start();
+        let conf = if go {
+            grader::grade_go(&img.tag, &src.reference_patch, &task_dir.join("oracle"), "")
+        } else {
+            grader::grade_repo(&img.tag, &src.reference_patch, &task_dir.join("oracle"))
+        };
+        let _ = fs::write(task_dir.join("confirm_grade.json"), to_json_pretty(&conf));
+        let conf = redact(&conf, &src.oracle_command);
+        let step = |name: &str| {
+            conf["steps"].as_array().into_iter().flatten().find(|s| s["step"] == name).map(|s| s["status"].as_str().unwrap_or("").to_owned())
+        };
+        // The upstream fix itself breaks the existing suite: the hidden tests are
+        // still a fair oracle, but that suite cannot tell regressions apart.
+        let suite_unusable = !go
+            && conf["final_status"] == "REPRODUCIBLE"
+            && step("B reproduce").as_deref() == Some("pass")
+            && step("D regression").as_deref() == Some("pass")
+            && step("E existing tests").as_deref() == Some("fail");
+        if suite_unusable {
+            let oracle_json = task_dir.join("oracle").join("oracle.json");
+            if let Some(mut o) = workspace::load_json(&oracle_json) {
+                o["test_command"] = "".into();
+                o["existing_tests_note"] = "the upstream fix already fails the existing test suite".into();
+                let _ = write_json(&oracle_json, &o);
+            }
+        }
+        let ok = conf["final_status"] == "PATCH_VERIFIED" || suite_unusable;
+        let summary = if suite_unusable {
+            "upstream fix verified against the hidden tests (they fail on the vulnerable code and pass with the fix); \
+             the upstream fix already fails the existing test suite, so regressions are not graded"
+                .to_owned()
+        } else if ok {
+            "upstream fix verified: the oracle fails on the vulnerable code and passes with the fix".to_owned()
+        } else {
+            format!(
+                "upstream fix not verified ({}); this CVE cannot be graded fairly",
+                conf["final_status"].as_str().unwrap_or("?")
+            )
+        };
+        p.rep.emit(
+            StageResult::new("4 confirm", if ok { "PASS" } else { "STOP" }, summary)
+                .lifecycle(if ok { "REPRODUCIBLE" } else { "INCONCLUSIVE" })
+                .secs(t.secs())
+                .facts(step_facts(&conf)),
+        );
+        p.set_lifecycle(if ok { "REPRODUCIBLE" } else { "INCONCLUSIVE" });
+        if !ok {
+            let more = info.commits.iter().any(|(_, _, sha)| !tried.iter().any(|t| t.starts_with(sha.as_str())));
+            if more {
+                p.rep.say("\nTrying the next upstream fix commit for this CVE.\n");
+                continue;
+            }
+            return Ok(p);
+        }
+        p.image = Some(img.tag);
+        let task_json = run_dir.join("task.json");
+        let _ = write_json(
+            &task_json,
+            &json!({"cve": cve, "repository": src.repo, "description": info.description,
+                    "cwe": info.cwes, "language": if go { "Go".to_owned() } else { src.profile.label.clone() },
+                    "module_root": "/work", "build_command": src.profile.build, "test_command": src.profile.test,
+                    "reproduction_test": "write your own reproduction test to prove the bug; the grader also runs hidden security tests"}),
+        );
+        p.task_json = Some(task_json);
         return Ok(p);
     }
-    p.image = Some(img.tag);
-    let task_json = run_dir.join("task.json");
-    let _ = write_json(
-        &task_json,
-        &json!({"cve": cve, "repository": src.repo, "description": info.description,
-                "cwe": info.cwes, "language": "Go", "module_root": "/work"}),
-    );
-    p.task_json = Some(task_json);
-    Ok(p)
 }
 
 fn grade_cve_attempt(p: &mut Task, n: u32, ws: &Path, report: Option<&Value>) -> Value {
@@ -766,11 +828,17 @@ fn grade_cve_attempt(p: &mut Task, n: u32, ws: &Path, report: Option<&Value>) ->
     let Some(src) = p.src.clone() else {
         return scoring::infrastructure_failure("no task source");
     };
-    let diff = patchlib::diff_trees(&src.baseline_dir, ws, "go");
+    let lang = src.profile.lang.clone();
+    let diff = patchlib::diff_trees(&src.baseline_dir, ws, &lang);
     let _ = fs::write(adir.join("candidate.patch"), &diff.code_patch);
     let _ = fs::write(adir.join("agent_tests.patch"), &diff.test_patch);
     let t = Timer::start();
-    let g = grader::grade_go(p.image.as_deref().unwrap_or(""), &diff.code_patch, &p.task_dir.join("oracle"), &diff.test_patch);
+    let image = p.image.clone().unwrap_or_default();
+    let g = if lang == "go" {
+        grader::grade_go(&image, &diff.code_patch, &p.task_dir.join("oracle"), &diff.test_patch)
+    } else {
+        grader::grade_repo(&image, &diff.code_patch, &p.task_dir.join("oracle"))
+    };
     let rc = scoring::check_report(report, &src.baseline_dir, &src.code_files);
     let mut dims = Map::new();
     for d in scoring::DIMENSIONS {
@@ -784,6 +852,7 @@ fn grade_cve_attempt(p: &mut Task, n: u32, ws: &Path, report: Option<&Value>) ->
     dims.insert("patch_provenance_verified".into(), provenance.into());
     let status = g["final_status"].as_str().unwrap_or("FAILED").to_owned();
     let sc = scoring::score(&dims, &status);
+    let shown = redact(&g, &src.oracle_command);
     let mut grade = g.clone();
     grade["dimensions"] = Value::Object(dims.clone());
     grade["score"] = sc.into();
@@ -792,8 +861,8 @@ fn grade_cve_attempt(p: &mut Task, n: u32, ws: &Path, report: Option<&Value>) ->
     grade["changed_code_files"] = json!(diff.code_files);
     grade["patch_sha256"] = if diff.code_patch.is_empty() { Value::Null } else { patchlib::sha256(&diff.code_patch).into() };
     let _ = fs::write(p.task_dir.join(format!("grade-attempt-{n}.json")), to_json_pretty(&grade));
-    // The visible copy leaves out the oracle's test names and logs.
-    let mut visible = grade.clone();
+    // The visible copy leaves out the oracle's test names, command and logs.
+    let mut visible = redact(&grade, &src.oracle_command);
     if let Some(o) = visible.as_object_mut() {
         o.remove("oracle_tests");
     }
@@ -811,7 +880,7 @@ fn grade_cve_attempt(p: &mut Task, n: u32, ws: &Path, report: Option<&Value>) ->
     let own = if ar["tests"].as_array().is_some_and(|t| !t.is_empty()) {
         format!("before fix: {}, after fix: {}", crate::report::value_text(&ar["before_fix"]), crate::report::value_text(&ar["after_fix"]))
     } else {
-        ar["detail"].as_str().unwrap_or("none").to_owned()
+        ar["detail"].as_str().unwrap_or(if lang == "go" { "none" } else { "not run outside Go" }).to_owned()
     };
     let checks = dims.iter().map(|(k, v)| format!("{k}={}", scoring::mark(v))).collect::<Vec<_>>().join(" ");
     let mut r = StageResult::new(
@@ -820,7 +889,7 @@ fn grade_cve_attempt(p: &mut Task, n: u32, ws: &Path, report: Option<&Value>) ->
         format!("verdict {status}, score {}/{}", fmt_score(sc), scoring::MAX_SCORE),
     )
     .secs(t.secs())
-    .facts(step_facts(&g))
+    .facts(step_facts(&shown))
     .fact("report check", rc["detail"].clone())
     .fact("agent's own repro test", own)
     .fact("checks", checks);
@@ -842,6 +911,27 @@ fn grade_cve_attempt(p: &mut Task, n: u32, ws: &Path, report: Option<&Value>) ->
     }
     grade["feedback"] = if verified { "".into() } else { cve_feedback(&g, report.is_some()).into() };
     grade
+}
+
+/// A grade with the hidden oracle command replaced in every step detail, for
+/// the outputs the agent can read.
+pub fn redact(g: &Value, oracle_command: &str) -> Value {
+    let mut g = g.clone();
+    if oracle_command.is_empty() {
+        return g;
+    }
+    if let Some(steps) = g["steps"].as_array_mut() {
+        for s in steps {
+            if let Some(d) = s["detail"].as_str() {
+                s["detail"] = d.replace(oracle_command, "hidden security tests").into();
+            }
+            if let Some(o) = s.as_object_mut() {
+                o.remove("log_tail");
+                o.remove("failed");
+            }
+        }
+    }
+    g
 }
 
 /// What failed, without revealing hidden tests or the upstream fix.

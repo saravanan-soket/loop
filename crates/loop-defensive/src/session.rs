@@ -27,11 +27,13 @@ use crate::sources::{self, Target};
 use crate::task::{self, Kind, Task};
 use crate::workspace::{Mode, Sandbox};
 
-/// Dependency dirs installed in the image (node_modules, composer vendor/),
-/// linked into the workspace so the agent's commands find them. Links never
-/// enter a diff.
-const LINK_DEPS: &str = "for d in node_modules vendor; do [ -d /opt/defensive/baseline/$d ] && \
-                         [ ! -e /work/$d ] && ln -s /opt/defensive/baseline/$d /work/$d; done; true";
+/// Dependency dirs installed in the image, put into the workspace so the
+/// agent's commands find them: node_modules linked, composer's vendor/ copied
+/// (its autoloader follows the real path). Neither enters a diff.
+const LINK_DEPS: &str = "[ -d /opt/defensive/baseline/node_modules ] && [ ! -e /work/node_modules ] && \
+                         ln -s /opt/defensive/baseline/node_modules /work/node_modules; \
+                         [ -d /opt/defensive/baseline/vendor ] && [ ! -e /work/vendor ] && \
+                         cp -a /opt/defensive/baseline/vendor /work/vendor; true";
 
 fn max_grades() -> u32 {
     std::env::var("DEFENSIVE_MAX_GRADES").ok().and_then(|s| s.parse().ok()).unwrap_or(3)

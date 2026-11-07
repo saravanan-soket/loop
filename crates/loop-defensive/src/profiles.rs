@@ -137,9 +137,14 @@ pub fn detect(root: &Path) -> Profile {
     }
     if has("pom.xml") {
         let mvn = if has("mvnw") { "./mvnw" } else { "mvn" };
-        let mut p = Profile::new("maven", "Java (Maven)", "docker.io/library/maven:3-eclipse-temurin-21");
+        let jdk = jdk_for(&read(root, "pom.xml"));
+        let mut p = Profile::new("maven", "Java (Maven)", &format!("docker.io/library/maven:3-eclipse-temurin-{jdk}"));
         p.deps = format!(
-            "chmod +x mvnw 2>/dev/null; ({mvn} -B -q dependency:go-offline; {mvn} -B -q -DskipTests test) || true"
+            // Run one existing test class: surefire fetches its test provider
+            // (JUnit 4 or 5) only when it actually runs a test.
+            "chmod +x mvnw 2>/dev/null; {mvn} -B -q dependency:go-offline; \
+             t=$(find . -path '*/src/test/*' -name '*Test.java' | head -1 | xargs -r basename | sed 's/\\.java$//'); \
+             ({mvn} -B -q test -Dtest=\"${{t:-DefensiveWarmUp}}\" -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false) || true"
         );
         p.build = format!("{mvn} -o -B -q -DskipTests compile");
         p.test = format!("{mvn} -o -B -q test");
@@ -148,7 +153,9 @@ pub fn detect(root: &Path) -> Profile {
     }
     if ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"].iter().any(|n| has(n)) {
         let gr = if has("gradlew") { "./gradlew" } else { "gradle" };
-        let mut p = Profile::new("gradle", "Java/Kotlin (Gradle)", "docker.io/library/gradle:8-jdk21");
+        let build = ["build.gradle", "build.gradle.kts"].iter().map(|n| read(root, n)).collect::<String>();
+        let jdk = jdk_for(&build);
+        let mut p = Profile::new("gradle", "Java/Kotlin (Gradle)", &format!("docker.io/library/gradle:8-jdk{jdk}"));
         p.deps = format!("chmod +x gradlew 2>/dev/null; {gr} --no-daemon -q testClasses || true");
         p.build = format!("{gr} --no-daemon --offline -q classes");
         p.test = format!("{gr} --no-daemon --offline -q test");
@@ -167,6 +174,21 @@ pub fn detect(root: &Path) -> Profile {
             String::new()
         };
         p.example = "bundle exec rspec spec/repro_spec.rb".into();
+        return p;
+    }
+    let gemspec = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().ends_with(".gemspec"));
+    if gemspec {
+        // A gem without a Gemfile: install its gemspec's dependencies through one
+        // generated in the image only.
+        let ver = version(&read(root, ".ruby-version"), "3.3", r"(\d+\.\d+)");
+        let mut p = Profile::new("ruby", "Ruby (gemspec)", &format!("docker.io/library/ruby:{ver}-bookworm"));
+        p.deps = "printf \"source 'https://rubygems.org'\\ngemspec\\ngem 'rake'\\ngem 'minitest'\\ngem 'test-unit'\\n\" > Gemfile && bundle install --jobs 4".into();
+        p.test = if has("Rakefile") { "bundle exec rake test".into() } else { String::new() };
+        p.example = "bundle exec ruby -Itest -Ilib test/repro_test.rb".into();
         return p;
     }
     if has("composer.json") {
@@ -227,6 +249,30 @@ pub fn detect(root: &Path) -> Profile {
     p
 }
 
+/// The JDK image (8, 11, 17 or 21) for the Java level a build file declares;
+/// 21 when it declares none. Old source levels do not compile on new JDKs.
+pub fn jdk_for(build: &str) -> u32 {
+    let re = Regex::new(
+        r"(?x)
+        <(?:maven\.compiler\.(?:source|target|release)|source|target|release|java\.version|jdk\.version)>\s*(?:1\.)?(\d+)
+        | (?:sourceCompatibility|targetCompatibility)\s*=\s*['\x22]?(?:JavaVersion\.VERSION_)?(?:1[._])?(\d+)
+        | languageVersion\.set\(\s*JavaLanguageVersion\.of\(\s*(\d+)",
+    )
+    .unwrap();
+    let level = re
+        .captures_iter(build)
+        .filter_map(|c| c.iter().skip(1).flatten().next().and_then(|m| m.as_str().parse::<u32>().ok()))
+        .filter(|v| (1..=30).contains(v))
+        .min();
+    match level {
+        None => 21,
+        Some(v) if v <= 8 => 8,
+        Some(v) if v <= 11 => 11,
+        Some(v) if v <= 17 => 17,
+        Some(_) => 21,
+    }
+}
+
 fn node(root: &Path) -> Profile {
     let pkg: serde_json::Value = serde_json::from_str(&read(root, "package.json")).unwrap_or_default();
     let engines = pkg
@@ -276,7 +322,7 @@ fn python(root: &Path) -> Profile {
     p.deps = "pip install -q --no-cache-dir pytest bandit; \
               for f in requirements*.txt requirements/*.txt; do [ -f \"$f\" ] && \
               pip install -q --no-cache-dir -r \"$f\"; done; \
-              if [ -f pyproject.toml ] || [ -f setup.py ]; then pip install -q --no-cache-dir . || true; fi"
+              if [ -f pyproject.toml ] || [ -f setup.py ]; then pip install -q --no-cache-dir \".[test,tests,testing,dev,crypto]\" || pip install -q --no-cache-dir . || true; fi"
         .into();
     p.build = "python -m compileall -q .".into();
     p.test = "python -m pytest -q -p no:cacheprovider".into();
@@ -343,6 +389,21 @@ mod tests {
         assert_eq!(detect(tree(&[("x.py", "")]).path()).lang, "python");
         assert_eq!(detect(tree(&[("index.html", "")]).path()).lang, "node");
         assert_eq!(detect(tree(&[("README", "")]).path()).lang, "generic");
+        let gem = detect(tree(&[("tzinfo.gemspec", ""), ("Rakefile", ""), ("lib/a.rb", "")]).path());
+        assert_eq!((gem.lang.as_str(), gem.test.as_str()), ("ruby", "bundle exec rake test"));
+        assert!(gem.deps.contains("gemspec"));
+    }
+
+    #[test]
+    fn jdk_from_build_files() {
+        assert_eq!(jdk_for("<properties><maven.compiler.source>1.6</maven.compiler.source></properties>"), 8);
+        assert_eq!(jdk_for("<source>11</source><target>11</target>"), 11);
+        assert_eq!(jdk_for("<release>17</release>"), 17);
+        assert_eq!(jdk_for("sourceCompatibility = JavaVersion.VERSION_1_8"), 8);
+        assert_eq!(jdk_for("java { toolchain { languageVersion.set(JavaLanguageVersion.of(21)) } }"), 21);
+        assert_eq!(jdk_for("<project></project>"), 21);
+        let d = tree(&[("pom.xml", "<maven.compiler.target>1.7</maven.compiler.target>")]);
+        assert_eq!(detect(d.path()).image, "docker.io/library/maven:3-eclipse-temurin-8");
     }
 
     #[test]

@@ -251,6 +251,10 @@ pub struct TaskSource {
     pub oracle_packages: Vec<String>,
     /// The upstream fix, code only.
     pub reference_patch: String,
+    /// The language profile (`go` for Go modules).
+    pub profile: crate::profiles::Profile,
+    /// Outside Go: the command that runs only the oracle tests.
+    pub oracle_command: String,
 }
 
 /// A bare, blobless clone in the cache.
@@ -299,11 +303,16 @@ fn pkg_of(path: &str) -> String {
 
 /// Stages 1-2 for a CVE: try each fix commit until one splits cleanly.
 pub fn fetch_and_split(info: &CveInfo, out: &Path) -> Result<TaskSource, StopStage> {
+    fetch_and_split_except(info, out, &[])
+}
+
+/// [`fetch_and_split`], skipping fix commits in `skip` (ones already tried).
+pub fn fetch_and_split_except(info: &CveInfo, out: &Path, skip: &[String]) -> Result<TaskSource, StopStage> {
     if info.commits.is_empty() {
         return Err(StopStage::new("UNSUPPORTED", "no GitHub fix commit in the official references"));
     }
     let mut errors = Vec::new();
-    for (owner, name, sha) in &info.commits {
+    for (owner, name, sha) in info.commits.iter().filter(|(_, _, sha)| !skip.iter().any(|s| s.starts_with(sha.as_str()))) {
         let short: String = sha.chars().take(10).collect();
         match split_one(owner, name, sha, out) {
             Ok(t) => return Ok(t),
@@ -335,39 +344,54 @@ fn split_one(owner: &str, name: &str, sha: &str, out: &Path) -> Result<TaskSourc
         return Err(StopStage::new("UNSUPPORTED", "fix renames files"));
     }
     let paths: Vec<(String, String)> = files.iter().map(|f| (f[0].to_owned(), f[f.len() - 1].to_owned())).collect();
-    if paths.iter().any(|(_, p)| {
-        let n = p.rsplit('/').next().unwrap_or(p);
-        n == "go.mod" || n == "go.sum"
-    }) {
-        return Err(StopStage::new("UNSUPPORTED", "fix changes go.mod/go.sum (new dependencies)"));
-    }
-    let gomod = git_ok(&["show", &format!("{vuln}:go.mod")], Some(&repo))
-        .map_err(|_| StopStage::new("UNSUPPORTED", "no go.mod at the repository root (not a Go module task)"))?;
-    let code: Vec<String> = paths.iter().filter(|(_, p)| patchlib::is_code_file(p, "go")).map(|(_, p)| p.clone()).collect();
+
+    // The vulnerable source decides the language.
+    let baseline = out.join("baseline");
+    extract_archive(&repo, &vuln, &baseline).map_err(err)?;
+    let profile = profiles::detect(&baseline);
+    let lang = profile.lang.clone();
+    let base_name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_owned();
+    let gomod = if lang == "go" {
+        if paths.iter().any(|(_, p)| matches!(base_name(p).as_str(), "go.mod" | "go.sum")) {
+            return Err(StopStage::new("UNSUPPORTED", "fix changes go.mod/go.sum (new dependencies)"));
+        }
+        fs::read_to_string(baseline.join("go.mod")).unwrap_or_default()
+    } else {
+        if let Some((_, p)) = paths.iter().find(|(_, p)| patchlib::MANIFESTS.contains(&base_name(p).as_str())) {
+            return Err(StopStage::new("UNSUPPORTED", format!("fix changes {p} (new dependencies cannot be installed offline)")));
+        }
+        String::new()
+    };
+    let code: Vec<String> = paths.iter().filter(|(_, p)| patchlib::is_code_file(p, &lang)).map(|(_, p)| p.clone()).collect();
     let tests: Vec<String> = paths
         .iter()
-        .filter(|(s, p)| patchlib::is_test_file(p, "go") && !s.starts_with('D'))
+        .filter(|(s, p)| patchlib::is_test_file(p, &lang) && !s.starts_with('D'))
         .map(|(_, p)| p.clone())
         .collect();
     if tests.is_empty() {
         return Err(StopStage::new("INCONCLUSIVE", "fix commit changes no test file (no oracle)"));
     }
     if code.is_empty() {
-        return Err(StopStage::new("UNSUPPORTED", "fix changes no non-test Go code"));
+        return Err(StopStage::new("UNSUPPORTED", format!("fix changes no non-test {} code", profile.label)));
     }
     let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", vuln.as_str(), full.as_str(), "--"];
     args.extend(tests.iter().map(String::as_str));
     let test_diff = git_ok(&args, Some(&repo)).map_err(err)?;
-    let funcs = patchlib::changed_test_funcs(&test_diff);
-    if funcs.is_empty() {
-        return Err(StopStage::new("INCONCLUSIVE", "could not tell which test functions the fix changed (no oracle)"));
-    }
+    let (funcs, oracle_command) = if lang == "go" {
+        let funcs = patchlib::changed_test_funcs(&test_diff);
+        if funcs.is_empty() {
+            return Err(StopStage::new("INCONCLUSIVE", "could not tell which test functions the fix changed (no oracle)"));
+        }
+        (funcs, String::new())
+    } else {
+        let cmd = crate::oracle::command(&profile, &baseline, &tests).map_err(|e| StopStage::new("INCONCLUSIVE", format!("{e} (no oracle)")))?;
+        (vec![], cmd)
+    };
     let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color", vuln.as_str(), full.as_str(), "--"];
     args.extend(code.iter().map(String::as_str));
     let reference = git_ok(&args, Some(&repo)).map_err(err)?;
 
-    let baseline = out.join("baseline");
-    extract_archive(&repo, &vuln, &baseline).map_err(err)?;
+    // Hidden oracle: the fix's test files, as they are at the fix commit.
     let oracle = out.join("oracle");
     if oracle.exists() {
         fs::remove_dir_all(&oracle).map_err(|e| err(e.to_string()))?;
@@ -385,11 +409,13 @@ fn split_one(owner: &str, name: &str, sha: &str, out: &Path) -> Result<TaskSourc
             pkgs.push(pkg);
         }
     }
-    crate::report::write_json(
-        &oracle.join("oracle.json"),
-        &json!({"run": format!("^({})$", funcs.join("|")), "tests": funcs, "packages": pkgs}),
-    )
-    .map_err(|e| err(e.to_string()))?;
+    let oracle_json = if lang == "go" {
+        json!({"run": format!("^({})$", funcs.join("|")), "tests": funcs, "packages": pkgs})
+    } else {
+        json!({"lang": lang, "repro_command": oracle_command, "build_command": profile.build, "test_command": profile.test,
+               "existing_tests_include_oracle": true, "timeout_reproduces": true})
+    };
+    crate::report::write_json(&oracle.join("oracle.json"), &oracle_json).map_err(|e| err(e.to_string()))?;
     fs::write(out.join("reference.patch"), &reference).map_err(|e| err(e.to_string()))?;
     Ok(TaskSource {
         repo: format!("{owner}/{name}"),
@@ -402,6 +428,8 @@ fn split_one(owner: &str, name: &str, sha: &str, out: &Path) -> Result<TaskSourc
         oracle_tests: funcs,
         oracle_packages: pkgs,
         reference_patch: reference,
+        profile,
+        oracle_command,
     })
 }
 
