@@ -137,14 +137,33 @@ pub fn remove(name: &str) {
     let _ = podman(&["rm", "-f", "-t", "0", name], Duration::from_secs(60));
 }
 
+/// An image-name component: lower-case alphanumerics joined by single dashes
+/// (a run slug like `local-.tmp` is not a valid reference otherwise).
+fn image_component(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_end_matches('-').to_owned();
+    if out.is_empty() {
+        "task".into()
+    } else {
+        out
+    }
+}
+
 /// `localhost/defensive-<name>:latest`.
 pub fn image_tag(name: &str) -> String {
-    format!("localhost/defensive-{}:latest", name.to_lowercase())
+    format!("localhost/defensive-{}:latest", image_component(name))
 }
 
 /// `localhost/defensive-audit-<slug>:latest`.
 pub fn audit_image_tag(slug: &str) -> String {
-    format!("localhost/defensive-audit-{slug}:latest")
+    format!("localhost/defensive-audit-{}:latest", image_component(slug))
 }
 
 /// The outcome of `podman build`.
@@ -466,6 +485,17 @@ mod tests {
         assert!(!dst.path().join("out/a/.git").exists());
         let link = dst.path().join("out/a/link");
         assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn image_tags_are_valid_references() {
+        assert_eq!(image_tag("repo-local-.tmp2erstg-625b6ce4"), "localhost/defensive-repo-local-tmp2erstg-625b6ce4:latest");
+        assert_eq!(image_tag("CVE-2022-36009"), "localhost/defensive-cve-2022-36009:latest");
+        assert_eq!(
+            image_tag("repo-soketlabs-tensorstudio-platform-backend"),
+            "localhost/defensive-repo-soketlabs-tensorstudio-platform-backend:latest"
+        );
+        assert_eq!(audit_image_tag("socket.io-x__y"), "localhost/defensive-audit-socket-io-x-y:latest");
     }
 
     #[test]
