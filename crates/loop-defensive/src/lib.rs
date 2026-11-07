@@ -11,9 +11,11 @@
 //! rootless podman with `--network none`.
 
 pub mod analyzers;
+pub mod grader;
 pub mod patchlib;
 pub mod profiles;
 pub mod report;
 pub mod sandbox;
 pub mod sources;
+pub mod workspace;
 pub mod scoring;
