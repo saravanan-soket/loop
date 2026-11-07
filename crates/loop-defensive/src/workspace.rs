@@ -366,7 +366,7 @@ impl Sandbox {
             "repro_command": field("repro_command"), "test_command": field("test_command"),
         });
         fs::create_dir_all(&self.state_dir).map_err(|e| format!("OSError: {e}"))?;
-        fs::write(self.state_dir.join("report.json"), to_json_pretty(&rep)).map_err(|e| format!("OSError: {e}"))?;
+        fs::write(self.state_dir.join("agent_report.json"), to_json_pretty(&rep)).map_err(|e| format!("OSError: {e}"))?;
         Ok(json!({"ok": true, "note": "report saved; submit or grade the fix when it is final"}))
     }
 
@@ -460,7 +460,7 @@ impl Sandbox {
 
     /// The submitted root-cause report, if any.
     pub fn report(&self) -> Option<Value> {
-        load_json(&self.state_dir.join("report.json"))
+        load_json(&self.state_dir.join("agent_report.json"))
     }
 }
 

@@ -948,7 +948,7 @@ pub fn emit_agent_stage(p: &mut Task, grades: u32, ws: &Path, calls: &[Value], r
 
 /// The submitted report of attempt `adir`.
 pub fn attempt_report(adir: &Path) -> Option<Value> {
-    workspace::load_json(&adir.join("report.json"))
+    workspace::load_json(&adir.join("agent_report.json"))
 }
 
 #[cfg(test)]
