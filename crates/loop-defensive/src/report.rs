@@ -366,3 +366,15 @@ mod tests {
         assert!(rep.take_output().contains("STAGE 2 SPLIT"));
     }
 }
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    #[test]
+    fn facts_keep_insertion_order() {
+        let r = StageResult::new("1 scope", "PASS", "x").fact("zeta", 1).fact("alpha", 2);
+        let keys: Vec<&String> = r.facts.keys().collect();
+        assert_eq!(keys, vec!["zeta", "alpha"]);
+    }
+}

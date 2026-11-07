@@ -10,7 +10,10 @@
 //! stage) under the runs directory. Repository code only ever runs inside
 //! rootless podman with `--network none`.
 
+pub mod analyzers;
 pub mod patchlib;
 pub mod profiles;
 pub mod report;
+pub mod sandbox;
+pub mod sources;
 pub mod scoring;
