@@ -17,5 +17,6 @@ pub mod profiles;
 pub mod report;
 pub mod sandbox;
 pub mod sources;
+pub mod task;
 pub mod workspace;
 pub mod scoring;
